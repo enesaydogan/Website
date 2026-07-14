@@ -621,7 +621,75 @@ const KNOWN_PAGES = [
     { name: 'Overlay-Watermark', url: 'https://platon-24.github.io/Overlay-Watermark/' },
     { name: 'kolay-photo',       url: 'https://platon-24.github.io/kolay-photo/' },
     { name: 'video-quick',       url: 'https://platon-24.github.io/video-quick/' },
+    { name: 'photoeasy',         url: 'https://platon-24.github.io/photoeasy/' },
 ];
+
+// ===== README CACHE =====
+const readmeCache = {};
+
+// ===== FETCH README DESCRIPTION =====
+async function fetchReadmeDesc(repoName) {
+    if (readmeCache[repoName] !== undefined) return readmeCache[repoName];
+    try {
+        const resp = await fetch(`https://api.github.com/repos/${GITHUB_USERNAME}/${repoName}/readme`);
+        if (!resp.ok) { readmeCache[repoName] = null; return null; }
+        const data = await resp.json();
+        // Decode base64 content (proper UTF-8)
+        const rawBytes = atob(data.content.replace(/\s/g, ''));
+        const raw = new TextDecoder('utf-8').decode(new Uint8Array([...rawBytes].map(c => c.charCodeAt(0))));
+        // Strip markdown/images/links/badges, get first meaningful text
+        let text = raw
+            .replace(/!\[[^\]]*\]\([^)]*\)/g, '')  // images
+            .replace(/\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)/g, '') // linked images
+            .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // links -> text
+            .replace(/<[^>]+>/g, '')            // HTML tags
+            .replace(/```[\s\S]*?```/g, '')    // code blocks
+            .replace(/`[^`]*`/g, '')            // inline code
+            .replace(/^#{1,6}\s+/gm, '')        // headings
+            .replace(/^\s*[-*+]\s+/gm, '')     // list items
+            .replace(/^\s*\d+\.\s+/gm, '')    // numbered lists
+            .replace(/\*\*([^*]*)\*\*/g, '$1') // bold
+            .replace(/\*([^*]*)\*/g, '$1')     // italic
+            .replace(/___/g, '')                 // hr
+            .replace(/---/g, '')                 // hr
+            .replace(/\|/g, ' ')                 // table pipes
+            .replace(/https?:\/\/\S+/g, '')     // bare URLs
+            .replace(/\n{2,}/g, '\n')           // collapse newlines
+            .replace(/^\s*\n/gm, '')            // empty lines
+            .trim();
+        // Split by newlines, find first non-empty meaningful line
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 15);
+        let desc = lines[0] || '';
+        // If first line is too short, combine with second
+        if (desc.length < 30 && lines[1]) {
+            desc += '. ' + lines[1];
+        }
+        // Limit to ~150 chars, break at sentence end
+        if (desc.length > 150) {
+            const cut = desc.substring(0, 150);
+            const lastDot = cut.lastIndexOf('.');
+            const lastTurk = Math.max(cut.lastIndexOf('?'), cut.lastIndexOf('!'));
+            const breakPoint = Math.max(lastDot, lastTurk);
+            desc = breakPoint > 30 ? cut.substring(0, breakPoint + 1) : cut + '...';
+        }
+        readmeCache[repoName] = desc || null;
+        return readmeCache[repoName];
+    } catch {
+        readmeCache[repoName] = null;
+        return null;
+    }
+}
+
+async function fetchReadmeForRepos(repoNames) {
+    const results = {};
+    for (let i = 0; i < repoNames.length; i++) {
+        const desc = await fetchReadmeDesc(repoNames[i]);
+        results[repoNames[i]] = desc;
+        // Small delay to avoid rate limiting
+        if (i < repoNames.length - 1) await new Promise(r => setTimeout(r, 80));
+    }
+    return results;
+}
 
 // ===== STATE =====
 let allRepos = [];
@@ -717,6 +785,7 @@ function renderRepoCard(repo, hasPages, pagesUrl) {
     const langColor = getLangColor(repo.language);
     const topics = (repo.topics || []).slice(0, 3);
     const updated = formatDate(repo.updated_at);
+    const desc = repo.description || readmeCache[repo.name] || 'Açıklama yok';
 
     let pagesLinkHTML = '';
     if (hasPages && pagesUrl) {
@@ -732,7 +801,7 @@ function renderRepoCard(repo, hasPages, pagesUrl) {
                 <a href="${repo.html_url}" target="_blank" rel="noopener">${repo.name}</a>
                 ${repo.archived ? '<span style="color:var(--text-secondary);font-size:0.7rem;background:var(--bg-card);padding:2px 8px;border-radius:4px;margin-left:8px;">Arşiv</span>' : ''}
             </h3>
-            <p class="repo-desc">${repo.description || 'Açıklama yok'}</p>
+            <p class="repo-desc">${desc}</p>
             <div class="repo-meta">
                 ${repo.language ? `<span><span class="lang-dot" style="background:${langColor}"></span>${repo.language}</span>` : ''}
                 ${repo.stargazers_count > 0 ? `<span>${starIcon()} ${repo.stargazers_count}</span>` : ''}
@@ -747,13 +816,14 @@ function renderRepoCard(repo, hasPages, pagesUrl) {
 }
 
 function renderPageCard(repo, pagesUrl) {
+    const desc = repo.description || readmeCache[repo.name] || 'Açıklama yok';
     return `
         <a href="${pagesUrl}" target="_blank" rel="noopener" class="page-card">
             <div class="live-badge">
                 <span class="live-dot"></span> CANLI
             </div>
             <h3>${repo.name}</h3>
-            <p>${repo.description || 'Açıklama yok'}</p>
+            <p>${desc}</p>
             <div class="page-url">${linkIcon()} ${pagesUrl}</div>
             ${repo.language ? `<div style="margin-top:12px;font-size:0.8rem;color:var(--text-secondary);">
                 <span class="lang-dot" style="background:${getLangColor(repo.language)}"></span> ${repo.language}
@@ -828,15 +898,18 @@ async function loadData() {
             // Still show known pages if any (reposuz da olsa)
             const pagesGrid = document.getElementById('pagesGrid');
             if (KNOWN_PAGES.length > 0) {
+                // Fetch READMEs for known pages
+                const kpNames = KNOWN_PAGES.map(kp => kp.name);
+                await fetchReadmeForRepos(kpNames);
                 pagesGrid.innerHTML = KNOWN_PAGES.map(kp => {
-                    const nameParts = kp.name.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                    const desc = readmeCache[kp.name] || 'GitHub Pages ile yayında';
                     return `
                         <a href="${kp.url}" target="_blank" rel="noopener" class="page-card">
                             <div class="live-badge">
                                 <span class="live-dot"></span> CANLI
                             </div>
                             <h3>${kp.name}</h3>
-                            <p>GitHub Pages ile yayında</p>
+                            <p>${desc}</p>
                             <div class="page-url">${linkIcon()} ${kp.url}</div>
                         </a>`;
                 }).join('');
@@ -882,22 +955,32 @@ async function loadData() {
                     const foundRepo = allRepos.find(r => r.name === kp.name);
                     if (foundRepo) {
                         pagesRepos.push({ repo: foundRepo, url: kp.url });
-                        // Update the specific card
-                        const idx = allRepos.indexOf(foundRepo);
-                        const cards = repoGrid.querySelectorAll('.repo-card');
-                        if (cards[idx]) {
-                            cards[idx].outerHTML = renderRepoCard(foundRepo, true, kp.url);
-                        }
                     }
                 }
             }
+
+            // Fetch README descriptions for all repos (özellikle açıklaması olmayanlar)
+            const reposNeedingDesc = allRepos.filter(r => !r.description).map(r => r.name);
+            if (reposNeedingDesc.length > 0) {
+                await fetchReadmeForRepos(reposNeedingDesc);
+            }
+
+            // Re-render ALL repo cards with README descriptions
+            const cards = repoGrid.querySelectorAll('.repo-card');
+            allRepos.forEach((repo, index) => {
+                const isPage = pagesRepos.some(p => p.repo.name === repo.name);
+                const pageUrl = pagesRepos.find(p => p.repo.name === repo.name)?.url || null;
+                if (cards[index]) {
+                    cards[index].outerHTML = renderRepoCard(repo, isPage, pageUrl);
+                }
+            });
 
             // Update pages count
             document.getElementById('statPages').textContent = pagesRepos.length;
             document.getElementById('pagesCount').textContent = pagesRepos.length;
             document.getElementById('pagesCountLabel').textContent = `(${pagesRepos.length} site)`;
 
-            // Render pages tab
+            // Re-render pages tab with README descriptions
             const pagesGrid = document.getElementById('pagesGrid');
             if (pagesRepos.length === 0) {
                 pagesGrid.innerHTML = renderEmptyPages();
@@ -919,18 +1002,24 @@ async function loadData() {
             </div>`;
         document.getElementById('userBio').textContent = 'Veri yüklenemedi.';
 
-        // Hata durumunda da bilinen Pages linklerini göster
+        // Hata durumunda da bilinen Pages linklerini göster (README açıklamalarıyla)
         const pagesGrid = document.getElementById('pagesGrid');
         if (KNOWN_PAGES.length > 0) {
-            pagesGrid.innerHTML = KNOWN_PAGES.map(kp => `
+            // Try to fetch READMEs even in error state
+            const kpNames = KNOWN_PAGES.map(kp => kp.name);
+            await fetchReadmeForRepos(kpNames).catch(() => {});
+            pagesGrid.innerHTML = KNOWN_PAGES.map(kp => {
+                const desc = readmeCache[kp.name] || 'GitHub Pages ile yayında';
+                return `
                 <a href="${kp.url}" target="_blank" rel="noopener" class="page-card">
                     <div class="live-badge">
                         <span class="live-dot"></span> CANLI
                     </div>
                     <h3>${kp.name}</h3>
-                    <p>GitHub Pages ile yayında</p>
+                    <p>${desc}</p>
                     <div class="page-url">${linkIcon()} ${kp.url}</div>
-                </a>`).join('');
+                </a>`;
+            }).join('');
             document.getElementById('statPages').textContent = KNOWN_PAGES.length;
             document.getElementById('pagesCount').textContent = KNOWN_PAGES.length;
             document.getElementById('pagesCountLabel').textContent = `(${KNOWN_PAGES.length} site)`;
